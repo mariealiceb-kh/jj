@@ -89,6 +89,10 @@ and this project adheres to
 
 ### Fixed bugs
 
+* On Unix, updating the working copy now writes files through a temporary file
+  and a rename, so other processes never see a modified file missing, or any
+  file partially written.
+
 * `jj git push` no longer validates (e.g. for empty descriptions) commits that
   are already on the remote as a tag.
 

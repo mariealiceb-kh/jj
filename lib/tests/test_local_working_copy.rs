@@ -22,6 +22,9 @@ use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic;
+use std::sync::atomic::AtomicBool;
+use std::thread;
 use std::time::Duration;
 use std::time::SystemTime;
 
@@ -2117,9 +2120,128 @@ fn test_check_out_existing_file_cannot_be_removed() -> TestResult {
     if !cfg!(windows) {
         assert_matches!(
             result,
-            Err(CheckoutError::Other { message, .. }) if message.contains("Failed to remove")
+            Err(CheckoutError::Other { message, .. })
+                if message.contains("Failed to write file")
         );
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test_case("modified"; "modified")]
+#[test_case("added"; "added")]
+#[test_case("conflict"; "conflict")]
+fn test_check_out_file_never_partially_visible_to_readers(case: &str) -> TestResult {
+    let mut test_workspace = TestWorkspace::init();
+    let repo = &test_workspace.repo;
+    let workspace_root = test_workspace.workspace.workspace_root().to_owned();
+
+    let file_path = repo_path("file");
+    let tree_with = |digit: &str| create_tree(repo, &[(file_path, &digit.repeat(64 * 1024))]);
+    let tree2 = tree_with("2");
+    let tree1 = match case {
+        "modified" => tree_with("1"),
+        "added" => create_tree(repo, &[]),
+        "conflict" => MergedTree::merge(Merge::from_vec(vec![
+            (tree_with("1"), "side 1".into()),
+            (tree_with("0"), "base".into()),
+            (tree2.clone(), "side 2".into()),
+        ]))
+        .block_on()?,
+        _ => unreachable!(),
+    };
+    let commits = [tree1, tree2].map(|tree| commit_with_tree(repo.store(), tree));
+
+    let ws = &mut test_workspace.workspace;
+    let disk_path = file_path.to_fs_path_unchecked(&workspace_root);
+    let mut expected_reads = vec![];
+    for commit in &commits {
+        ws.check_out(repo.op_id().clone(), None, commit)
+            .block_on()?;
+        expected_reads.push(std::fs::read(&disk_path).ok());
+    }
+    let stray_entries = |dir: &Path| -> io::Result<Vec<std::ffi::OsString>> {
+        std::fs::read_dir(dir)?
+            .map_ok(|entry| entry.file_name())
+            .filter_ok(|name| name != ".jj" && name != ".git" && name != "file")
+            .collect()
+    };
+
+    let done = Arc::new(AtomicBool::new(false));
+    let reader = thread::spawn({
+        let done = done.clone();
+        let workspace_root = workspace_root.clone();
+        move || {
+            let mut bad_reads = 0;
+            while !done.load(atomic::Ordering::Relaxed) {
+                let read_ok = match std::fs::read(&disk_path) {
+                    Ok(contents) => expected_reads.contains(&Some(contents)),
+                    Err(err) => {
+                        err.kind() == io::ErrorKind::NotFound && expected_reads.contains(&None)
+                    }
+                };
+                if !read_ok || !stray_entries(&workspace_root).is_ok_and(|names| names.is_empty()) {
+                    bad_reads += 1;
+                }
+            }
+            bad_reads
+        }
+    });
+    for commit in commits.iter().cycle().take(200) {
+        ws.check_out(repo.op_id().clone(), None, commit)
+            .block_on()?;
+    }
+    done.store(true, atomic::Ordering::Relaxed);
+    assert_eq!(reader.join().unwrap(), 0);
+
+    assert_eq!(
+        stray_entries(&workspace_root)?,
+        Vec::<std::ffi::OsString>::new()
+    );
+    let new_tree = test_workspace.snapshot()?;
+    assert_tree_eq!(new_tree, commits[1].tree());
+    Ok(())
+}
+
+#[test]
+fn test_check_out_removes_stale_temp_files() -> TestResult {
+    let mut test_workspace = TestWorkspace::init();
+    let repo = &test_workspace.repo;
+    let state_dir = test_workspace
+        .workspace
+        .workspace_root()
+        .join(".jj/working_copy");
+    std::fs::write(state_dir.join(".jj-checkout-stale"), "")?;
+    std::fs::write(state_dir.join(".tmp-other"), "")?;
+
+    let commit = commit_with_tree(repo.store(), create_tree(repo, &[(repo_path("file"), "")]));
+    let ws = &mut test_workspace.workspace;
+    ws.check_out(repo.op_id().clone(), None, &commit)
+        .block_on()?;
+
+    assert!(!state_dir.join(".jj-checkout-stale").exists());
+    assert!(state_dir.join(".tmp-other").exists());
+    Ok(())
+}
+
+#[test]
+fn test_snapshot_skips_untracked_checkout_temp_files() -> TestResult {
+    let mut test_workspace = TestWorkspace::init();
+    let repo = test_workspace.repo.clone();
+    let workspace_root = test_workspace.workspace.workspace_root().to_owned();
+    let tracked_path = repo_path("dir/.jj-checkout-tracked");
+    let untracked_path = repo_path("dir/.jj-checkout-abc123");
+
+    let tree = create_tree(&repo, &[(tracked_path, "tracked")]);
+    let commit = commit_with_tree(repo.store(), tree.clone());
+    test_workspace
+        .workspace
+        .check_out(repo.op_id().clone(), None, &commit)
+        .block_on()?;
+    testutils::write_working_copy_file(&workspace_root, untracked_path, "partial");
+
+    let new_tree = test_workspace.snapshot()?;
+    assert_tree_eq!(new_tree, tree);
     Ok(())
 }
 

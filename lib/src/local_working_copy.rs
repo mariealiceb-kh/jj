@@ -95,6 +95,7 @@ use jj_local_util::file_util::FileIdentity;
 use jj_local_util::file_util::check_symlink_support;
 use jj_local_util::file_util::copy_async_to_sync;
 use jj_local_util::file_util::new_temp_file_with_default_permissions;
+use jj_local_util::file_util::new_temp_file_with_default_permissions_and_prefix;
 use jj_local_util::file_util::persist_temp_file;
 use jj_local_util::file_util::symlink_file;
 use jj_local_util::lock::FileLock;
@@ -104,6 +105,7 @@ use prost::Message as _;
 use rayon::iter::IntoParallelIterator as _;
 use rayon::prelude::IndexedParallelIterator as _;
 use rayon::prelude::ParallelIterator as _;
+use tempfile::NamedTempFile;
 use thiserror::Error;
 use tracing::instrument;
 use tracing::trace_span;
@@ -271,11 +273,11 @@ impl ExecBit {
 /// This is necessary because we write all files by creating them new, so files
 /// won't preserve their permissions naturally.
 #[cfg_attr(windows, expect(unused_variables))]
-fn set_executable(exec_bit: ExecBit, disk_path: &Path) -> Result<(), io::Error> {
+fn set_executable(exec_bit: ExecBit, file: &File) -> Result<(), io::Error> {
     #[cfg(unix)]
     {
         let mode = if exec_bit.0 { 0o755 } else { 0o644 };
-        fs::set_permissions(disk_path, fs::Permissions::from_mode(mode))?;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
     }
     Ok(())
 }
@@ -821,6 +823,8 @@ fn can_create_new_file(disk_path: &Path) -> Result<bool, CheckoutError> {
 }
 
 const RESERVED_DIR_NAMES: &[&str] = &[".git", ".jj"];
+
+const CHECKOUT_TEMP_FILE_PREFIX: &str = ".jj-checkout-";
 
 fn file_identity_from_symlink_path(disk_path: &Path) -> io::Result<Option<FileIdentity>> {
     match FileIdentity::from_symlink_path(disk_path) {
@@ -1742,6 +1746,11 @@ impl FileSnapshotter<'_> {
         {
             return Ok(None);
         }
+        // Left behind if a checkout crashed while writing to another file system.
+        if maybe_current_file_state.is_none() && name_string.starts_with(CHECKOUT_TEMP_FILE_PREFIX)
+        {
+            return Ok(None);
+        }
 
         if file_type.is_dir() {
             let file_states = file_states.prefixed_at(dir, name);
@@ -2166,15 +2175,36 @@ fn snapshot_error_for_mtime_out_of_range(err: MtimeOutOfRange, path: &Path) -> S
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WriteMode {
+    CreateNew,
+    RenameNoClobber,
+    RenameOver,
+}
+
 /// Functions to update local-disk files from the store.
 impl TreeState {
+    /// Returns `None` if the path must be skipped because something already
+    /// exists there.
     async fn write_file(
         &self,
         disk_path: &Path,
         contents: impl AsyncRead + Send + Unpin,
         exec_bit: ExecBit,
         apply_eol_conversion: bool,
-    ) -> Result<FileState, CheckoutError> {
+        mode: WriteMode,
+    ) -> Result<Option<FileState>, CheckoutError> {
+        if mode != WriteMode::CreateNew {
+            return self
+                .write_file_atomically(
+                    disk_path,
+                    contents,
+                    exec_bit,
+                    apply_eol_conversion,
+                    mode == WriteMode::RenameOver,
+                )
+                .await;
+        }
         let mut file = File::options()
             .write(true)
             .create_new(true) // Don't overwrite un-ignored file. Don't follow symlink.
@@ -2183,6 +2213,104 @@ impl TreeState {
                 message: format!("Failed to open file {} for writing", disk_path.display()),
                 err: err.into(),
             })?;
+        self.write_file_contents(
+            &mut file,
+            disk_path,
+            contents,
+            exec_bit,
+            apply_eol_conversion,
+        )
+        .await
+        .map(Some)
+    }
+
+    /// Writes a temporary file and renames it to `disk_path`, so readers never
+    /// see the file partially written.
+    async fn write_file_atomically(
+        &self,
+        disk_path: &Path,
+        contents: impl AsyncRead + Send + Unpin,
+        exec_bit: ExecBit,
+        apply_eol_conversion: bool,
+        overwrite: bool,
+    ) -> Result<Option<FileState>, CheckoutError> {
+        let new_temp_file = |dir: &Path| {
+            new_temp_file_with_default_permissions_and_prefix(dir, CHECKOUT_TEMP_FILE_PREFIX)
+                .map_err(|err| CheckoutError::Other {
+                    message: format!("Failed to create temporary file in {}", dir.display()),
+                    err: err.into(),
+                })
+        };
+        // Not persist_temp_file(): an fsync per file would slow down large checkouts.
+        let persist = |temp_file: NamedTempFile| {
+            if overwrite {
+                temp_file.persist(disk_path)
+            } else {
+                temp_file.persist_noclobber(disk_path)
+            }
+        };
+        // Outside the working copy, so that a crash can't leave it there.
+        let mut temp_file = new_temp_file(&self.state_path)?;
+        let mut file_state = self
+            .write_file_contents(
+                temp_file.as_file_mut(),
+                disk_path,
+                contents,
+                exec_bit,
+                apply_eol_conversion,
+            )
+            .await?;
+        let mut persisted = persist(temp_file);
+        if let Err(err) = &persisted
+            && err.error.kind() == io::ErrorKind::CrossesDevices
+        {
+            // The path is on another file system, such as a mount point.
+            let written = err.file.reopen().map_err(|err| CheckoutError::Other {
+                message: "Failed to reopen temporary file".to_string(),
+                err: err.into(),
+            })?;
+            let mut temp_file =
+                new_temp_file(disk_path.parent().expect("content path shouldn't be root"))?;
+            file_state = self
+                .write_file_contents(
+                    temp_file.as_file_mut(),
+                    disk_path,
+                    AllowStdIo::new(written),
+                    exec_bit,
+                    false,
+                )
+                .await?;
+            persisted = persist(temp_file);
+        }
+        match persisted {
+            Ok(file) if !overwrite => {
+                reject_reserved_existing_file(file, disk_path).inspect_err(|_| {
+                    fs::remove_file(disk_path).ok();
+                })?;
+            }
+            Ok(_) => {}
+            Err(err) if !overwrite && err.error.kind() == io::ErrorKind::AlreadyExists => {
+                reject_reserved_existing_path(disk_path)?;
+                return Ok(None);
+            }
+            Err(err) => {
+                return Err(CheckoutError::Other {
+                    message: format!("Failed to write file {}", disk_path.display()),
+                    err: err.error.into(),
+                });
+            }
+        }
+        Ok(Some(file_state))
+    }
+
+    async fn write_file_contents(
+        &self,
+        file: &mut File,
+        disk_path: &Path,
+        contents: impl AsyncRead + Send + Unpin,
+        exec_bit: ExecBit,
+        apply_eol_conversion: bool,
+    ) -> Result<FileState, CheckoutError> {
         let contents = if apply_eol_conversion {
             self.target_eol_strategy
                 .convert_eol_for_update(contents)
@@ -2194,7 +2322,7 @@ impl TreeState {
         } else {
             Box::new(contents)
         };
-        let size = copy_async_to_sync(contents, &mut file)
+        let size = copy_async_to_sync(contents, &mut *file)
             .await
             .map_err(|err| CheckoutError::Other {
                 message: format!(
@@ -2203,7 +2331,7 @@ impl TreeState {
                 ),
                 err: err.into(),
             })?;
-        set_executable(exec_bit, disk_path)
+        set_executable(exec_bit, file)
             .map_err(|err| checkout_error_for_stat_error(err, disk_path))?;
         // Read the file state from the file descriptor. That way, know that the file
         // exists and is of the expected type, and the stat information is most likely
@@ -2253,43 +2381,6 @@ impl TreeState {
             .map_err(|err| checkout_error_for_mtime_out_of_range(err, disk_path))
     }
 
-    async fn write_conflict(
-        &self,
-        disk_path: &Path,
-        contents: &[u8],
-        exec_bit: ExecBit,
-    ) -> Result<FileState, CheckoutError> {
-        let contents = self
-            .target_eol_strategy
-            .convert_eol_for_update(contents)
-            .await
-            .map_err(|err| CheckoutError::Other {
-                message: "Failed to convert the EOL when writing a merge conflict".to_string(),
-                err: err.into(),
-            })?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true) // Don't overwrite un-ignored file. Don't follow symlink.
-            .open(disk_path)
-            .map_err(|err| CheckoutError::Other {
-                message: format!("Failed to open file {} for writing", disk_path.display()),
-                err: err.into(),
-            })?;
-        let size = copy_async_to_sync(contents, &mut file)
-            .await
-            .map_err(|err| CheckoutError::Other {
-                message: format!("Failed to write conflict to file {}", disk_path.display()),
-                err: err.into(),
-            })? as u64;
-        set_executable(exec_bit, disk_path)
-            .map_err(|err| checkout_error_for_stat_error(err, disk_path))?;
-        let metadata = file
-            .metadata()
-            .map_err(|err| checkout_error_for_stat_error(err, disk_path))?;
-        FileState::for_file(exec_bit, size, &metadata)
-            .map_err(|err| checkout_error_for_mtime_out_of_range(err, disk_path))
-    }
-
     pub async fn check_out(
         &mut self,
         new_tree: &MergedTree,
@@ -2328,6 +2419,23 @@ impl TreeState {
         })
     }
 
+    /// Removes temporary files left in the state directory by a checkout that
+    /// crashed. None can be in use, since the working copy is locked.
+    fn remove_stale_temp_files(&self) {
+        let Ok(entries) = fs::read_dir(&self.state_path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(CHECKOUT_TEMP_FILE_PREFIX))
+            {
+                fs::remove_file(entry.path()).ok();
+            }
+        }
+    }
+
     async fn update(
         &mut self,
         old_tree: &MergedTree,
@@ -2342,6 +2450,7 @@ impl TreeState {
             removed_files: 0,
             skipped_files: 0,
         };
+        self.remove_stale_temp_files();
         let mut changed_file_states = Vec::new();
         let mut deleted_files = HashSet::new();
         let mut prev_created_path: RepoPathBuf = RepoPathBuf::root();
@@ -2423,16 +2532,41 @@ impl TreeState {
                 disk_path
             };
 
+            let writes_regular_file = match after {
+                MaterializedTreeValue::File(_)
+                | MaterializedTreeValue::FileConflict(_)
+                | MaterializedTreeValue::OtherConflict { .. } => true,
+                MaterializedTreeValue::Symlink { .. } => !self.symlink_support,
+                _ => false,
+            };
+            // Renaming over a file fails on Windows while another process has it open.
+            let write_mode = if cfg!(windows) || !writes_regular_file {
+                WriteMode::CreateNew
+            } else if before.is_present()
+                && !matches!(before.as_normal(), Some(TreeValue::GitSubmodule(_)))
+                && disk_path.symlink_metadata().is_ok_and(|m| m.is_file())
+            {
+                WriteMode::RenameOver
+            } else {
+                WriteMode::RenameNoClobber
+            };
+
             // If the path was present, check reserved path first and delete it.
             let present_file_deleted = before.is_present()
-                && if matches!(before.as_normal(), Some(TreeValue::GitSubmodule(_))) {
+                && if write_mode == WriteMode::RenameOver {
+                    reject_reserved_existing_path(&disk_path)?;
+                    true
+                } else if matches!(before.as_normal(), Some(TreeValue::GitSubmodule(_))) {
                     remove_old_submodule_dir(&disk_path)?
                 } else {
                     remove_old_file(&disk_path)?
                 };
 
             // If not, create temporary file to test the path validity.
-            if !present_file_deleted && !can_create_new_file(&disk_path)? {
+            if !present_file_deleted
+                && write_mode == WriteMode::CreateNew
+                && !can_create_new_file(&disk_path)?
+            {
                 if matches!(after, MaterializedTreeValue::GitSubmodule(_)) && disk_path.is_dir() {
                     // Failing to materialize submodule, over a directory which
                     // is presumably the submodule before it was added in a
@@ -2481,15 +2615,16 @@ impl TreeState {
                 MaterializedTreeValue::File(file) => {
                     let exec_bit =
                         ExecBit::new_from_repo(file.executable, self.exec_policy, get_prev_exec);
-                    self.write_file(&disk_path, file.reader, exec_bit, true)
+                    self.write_file(&disk_path, file.reader, exec_bit, true, write_mode)
                         .await?
                 }
                 MaterializedTreeValue::Symlink { id: _, target } => {
                     if self.symlink_support {
-                        self.write_symlink(&disk_path, target)?
+                        Some(self.write_symlink(&disk_path, target)?)
                     } else {
                         // The fake symlink file shouldn't be executable.
-                        self.write_file(&disk_path, target.as_bytes(), ExecBit(false), false)
+                        let contents = target.as_bytes();
+                        self.write_file(&disk_path, contents, ExecBit(false), false, write_mode)
                             .await?
                     }
                 }
@@ -2504,7 +2639,7 @@ impl TreeState {
                             "warning: failed to create submodule directory {path:?}: {err}"
                         ),
                     }
-                    FileState::for_gitsubmodule()
+                    Some(FileState::for_gitsubmodule())
                 }
                 MaterializedTreeValue::Tree(_) => {
                     panic!("unexpected tree entry in diff at {path:?}");
@@ -2524,21 +2659,32 @@ impl TreeState {
                     );
                     let contents =
                         materialize_merge_result_to_bytes(&file.contents, &file.labels, &options);
-                    let mut file_state =
-                        self.write_conflict(&disk_path, &contents, exec_bit).await?;
-                    file_state.materialized_conflict_data = Some(MaterializedConflictData {
-                        conflict_marker_len: conflict_marker_len.try_into().unwrap_or(u32::MAX),
-                    });
-                    file_state
+                    self.write_file(&disk_path, contents.as_slice(), exec_bit, true, write_mode)
+                        .await?
+                        .map(|mut file_state| {
+                            file_state.materialized_conflict_data =
+                                Some(MaterializedConflictData {
+                                    conflict_marker_len: conflict_marker_len
+                                        .try_into()
+                                        .unwrap_or(u32::MAX),
+                                });
+                            file_state
+                        })
                 }
                 MaterializedTreeValue::OtherConflict { id, labels } => {
                     // Unless all terms are regular files, we can't do much
                     // better than trying to describe the merge.
                     let contents = id.describe(&labels);
                     // Since this is a dummy file, it shouldn't be executable.
-                    self.write_conflict(&disk_path, contents.as_bytes(), ExecBit(false))
+                    let contents = contents.as_bytes();
+                    self.write_file(&disk_path, contents, ExecBit(false), true, write_mode)
                         .await?
                 }
+            };
+            let Some(file_state) = file_state else {
+                changed_file_states.push((path, FileState::placeholder()));
+                stats.skipped_files += 1;
+                return Ok(());
             };
             changed_file_states.push((path, file_state));
             Ok(())
